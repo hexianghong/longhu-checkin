@@ -42,6 +42,8 @@ PAGE_VERSION = "475"
 EP_LOGIN = "/api-gw/oauthserver/account/v1/login"
 EP_REFRESH = "/api-gw/oauthserver/account/v1/refreshToken"
 EP_SIGN = "/api-gw/zjBaseServer/daily/sign"
+EP_SIGN_STATUS = "/api-gw/zjBaseServer/daily/getSignStatus"
+EP_MINE_INFO = "/api-gw/zjBaseServer/minetab/v2/user/additional/info"
 EP_APPLET_USERINFO = "/api-gw/oauthserver/applet/v1/userinfo/query"
 
 DEFAULT_UA = (
@@ -288,20 +290,25 @@ def refresh_token(account: dict) -> tuple[bool, dict | str]:
 
 
 def fetch_profile(account: dict) -> dict:
-    """查询海尔智家账号资料（手机号、用户名/昵称、userId）。"""
+    """查询海尔智家账号资料（手机号、昵称、海贝积分、成长值、等级、连签天数）。"""
     token = (account.get("token") or "").strip()
     if not token:
         raise HaierError("缺少 accountToken")
 
-    # 1. 优先查官方 OAuth userinfo 接口
+    client_id = (account.get("client_id") or "").strip() or random_client_id()
+    ua = account.get("user_agent") or DEFAULT_UA
+    profile: dict = {}
+
+    # 1. 查官方 OAuth userinfo 接口（获取手机号、用户名、userId）
     session = requests.Session()
     session.trust_env = False
+    oauth_err = ""
     try:
         resp = session.get(
             USER_INFO_API,
             headers={
                 "Authorization": f"Bearer {token}",
-                "User-Agent": account.get("user_agent") or DEFAULT_UA,
+                "User-Agent": ua,
             },
             timeout=15,
         )
@@ -314,51 +321,77 @@ def fetch_profile(account: dict) -> dict:
     if isinstance(data, dict) and (data.get("userId") or data.get("mobile")):
         mobile = str(data.get("mobile") or "")
         username = str(data.get("username") or data.get("nickName") or "")
-        return {
-            "user_id": str(data.get("userId") or ""),
-            "phone": mask_phone(mobile) or mobile,
-            "nickname": username or mask_phone(mobile),
-        }
+        profile["user_id"] = str(data.get("userId") or "")
+        profile["phone"] = mask_phone(mobile) or mobile
+        profile["nickname"] = username or mask_phone(mobile)
+    elif isinstance(data, dict):
+        oauth_err = str(data.get("error_description") or "")
 
-    # 2. 兜底查小程序 userinfo/query 接口
-    client_id = (account.get("client_id") or "").strip() or random_client_id()
-    body_text = "{}"
-    headers = _build_headers(
-        EP_APPLET_USERINFO,
-        body_text,
+    # 2. 查小程序「我的」资产接口（获取海贝积分 haibei、成长值 growth、等级 vipLevelName）
+    mine_payload = {"channel": "ZHI_JIA"}
+    mine_body = json.dumps(mine_payload, separators=(",", ":"), ensure_ascii=False)
+    mine_headers = _build_headers(
+        EP_MINE_INFO,
+        mine_body,
         token=token,
         client_id=client_id,
         app_source=APP_SOURCE_WXAPP,
-        user_agent=account.get("user_agent") or DEFAULT_UA,
+        user_agent=ua,
     )
-    res = _request("POST", f"{BASE}{EP_APPLET_USERINFO}", headers, {})
-    if str(res.get("retCode") or "") == "00000":
-        udata = res.get("data") if isinstance(res.get("data"), dict) else {}
-        mobile = str(udata.get("mobile") or udata.get("phone") or "")
-        nick = str(udata.get("nickName") or udata.get("userName") or udata.get("username") or "")
-        return {
-            "user_id": str(udata.get("userId") or udata.get("id") or ""),
-            "phone": mask_phone(mobile) or mobile,
-            "nickname": nick or mask_phone(mobile),
-        }
+    mine_err = ""
+    try:
+        mine_res = _request("POST", f"{BASE}{EP_MINE_INFO}", mine_headers, mine_payload)
+        if str(mine_res.get("retCode") or "") == "00000":
+            mdata = mine_res.get("data") if isinstance(mine_res.get("data"), dict) else {}
+            try:
+                profile["balance"] = int(float(mdata.get("haibei") or 0))
+            except (TypeError, ValueError):
+                profile["balance"] = 0
+            try:
+                profile["growth_value"] = int(float(mdata.get("growth") or 0))
+            except (TypeError, ValueError):
+                profile["growth_value"] = 0
+            profile["level_name"] = str(mdata.get("vipLevelName") or "")
+            profile["red_packet"] = str(mdata.get("redPacket") or "0.00")
+        else:
+            mine_err = str(mine_res.get("retInfo") or "")
+    except HaierError as exc:
+        mine_err = str(exc)
 
-    err = (
-        (data.get("error_description") if isinstance(data, dict) else "")
-        or res.get("retInfo")
-        or "accountToken 无效或已过期"
-    )
-    raise HaierError(str(err))
+    # 3. 查今日签到状态与连续签到天数
+    try:
+        st_headers = _build_headers(
+            EP_SIGN_STATUS,
+            "",
+            token=token,
+            client_id=client_id,
+            app_source=APP_SOURCE_WXAPP,
+            user_agent=ua,
+        )
+        st_res = _request("GET", f"{BASE}{EP_SIGN_STATUS}", st_headers, None)
+        if str(st_res.get("retCode") or "") == "00000":
+            sdata = st_res.get("data") if isinstance(st_res.get("data"), dict) else {}
+            if sdata.get("totalSignDay") is not None:
+                profile["sign_days"] = int(sdata.get("totalSignDay") or 0)
+            profile["signed_today"] = bool(sdata.get("signStatus"))
+    except Exception:
+        pass
+
+    if profile:
+        return profile
+
+    raise HaierError(oauth_err or mine_err or "accountToken 无效或已过期")
 
 
-def checkin(account: dict) -> tuple[str, str, int | None]:
+def checkin(account: dict) -> tuple[str, str, int | None, int | None]:
     """执行海尔智家小程序每日签到。
 
-    返回 (status, message, total_sign_days)
+    返回 (status, message, total_sign_days, reward_haibei)
     status: ok / already / fail
     """
     token = (account.get("token") or "").strip()
     if not token:
-        return "fail", "【海尔】缺少 accountToken", None
+        return "fail", "【海尔】缺少 accountToken", None, None
 
     client_id = (account.get("client_id") or "").strip() or random_client_id()
     body_text = "{}"
@@ -373,7 +406,7 @@ def checkin(account: dict) -> tuple[str, str, int | None]:
     try:
         res = _request("POST", f"{BASE}{EP_SIGN}", headers, {})
     except HaierError as exc:
-        return "fail", f"【海尔】签到请求失败：{exc}", None
+        return "fail", f"【海尔】签到请求失败：{exc}", None, None
 
     ret_code = str(res.get("retCode") or "")
     data = res.get("data") if isinstance(res.get("data"), dict) else {}
@@ -387,24 +420,43 @@ def checkin(account: dict) -> tuple[str, str, int | None]:
     except (TypeError, ValueError):
         total_days = None
 
-    reward_point = data.get("point") or data.get("signPoint") or data.get("rewardPoint") or data.get("score")
+    raw_reward = (
+        data.get("haibeiCount")
+        if data.get("haibeiCount") is not None
+        else data.get("point") or data.get("signPoint") or data.get("rewardPoint") or data.get("score")
+    )
+    try:
+        reward_point = int(raw_reward) if raw_reward is not None else None
+    except (TypeError, ValueError):
+        reward_point = None
+
+    is_first = data.get("first")
 
     if ret_code == "00000" or res.get("code") == 200 or res.get("success") is True:
+        # 海尔 daily/sign 接口在当天重复调用时同样返回 00000，通过 data.first 区分首次签到与今日已签
+        if is_first is False:
+            parts = ["【海尔】今日已签到"]
+            if reward_point is not None:
+                parts.append(f"今日奖励 +{reward_point} 海贝")
+            if total_days is not None:
+                parts.append(f"已连续签到 {total_days} 天")
+            return "already", "，".join(parts), total_days, reward_point
+
         parts = ["【海尔】签到成功"]
+        if reward_point is not None:
+            parts.append(f"获得 {reward_point} 海贝")
         if total_days is not None:
             parts.append(f"已连续签到 {total_days} 天")
-        if reward_point:
-            parts.append(f"+{reward_point} 积分")
-        return "ok", "，".join(parts), total_days
+        return "ok", "，".join(parts), total_days, reward_point
 
     if re.search(r"已签|签到过|重复|已完成", msg):
         suffix = f"，已连续签到 {total_days} 天" if total_days is not None else f"（{msg}）"
-        return "already", f"【海尔】今日已签到{suffix}", total_days
+        return "already", f"【海尔】今日已签到{suffix}", total_days, reward_point
 
     if re.search(r"用户信息获取失败|token|登录|未授权|失效|过期|未登录|鉴权", msg, re.I):
-        return "fail", f"【海尔】鉴权失效：{msg or 'accountToken 已过期，请更新凭据或配置 refreshToken'}", None
+        return "fail", f"【海尔】鉴权失效：{msg or 'accountToken 已过期，请更新凭据或配置 refreshToken'}", None, None
 
-    return "fail", f"【海尔】签到失败：{msg or '未知错误'}（retCode={ret_code or '无'}）", None
+    return "fail", f"【海尔】签到失败：{msg or '未知错误'}（retCode={ret_code or '无'}）", None, None
 
 
 # --------------------------------------------------------------------------
@@ -513,13 +565,17 @@ def parse_har(raw: str | bytes) -> dict:
         token = _extract_token_from_headers(headers)
         refresh_tok = ""
 
-        # 检查请求体和响应体是否带 tokenInfo / refreshToken
+        # 检查请求体和响应体是否带 tokenInfo / refreshToken / hermes registerUser token
         post_text = ((req.get("postData") or {}).get("text")) or ""
         if post_text:
             try:
                 pjson = json.loads(post_text)
                 if isinstance(pjson, dict):
                     refresh_tok = str(pjson.get("refreshToken") or "").strip()
+                    if not token:
+                        hermes_tok = (((pjson.get("from") or {}).get("user") or {}).get("token")) or ""
+                        if isinstance(hermes_tok, str) and len(hermes_tok.strip()) >= 12:
+                            token = hermes_tok.strip()
             except Exception:
                 pass
 

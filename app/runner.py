@@ -179,10 +179,14 @@ def run_haier_account(account: dict, do_checkin: bool = True,
         if payload.get("expires_in"):
             updates["expire_at"] = haier.expire_at(payload["expires_in"])
         if payload.get("profile"):
-            result["profile"] = payload["profile"]
-            nick = payload["profile"].get("nickname")
-            if nick:
-                updates["nickname"] = nick
+            prof = payload["profile"]
+            result["profile"] = prof
+            for col, key in (("nickname", "nickname"), ("balance", "balance"),
+                             ("growth_value", "growth_value"), ("level_name", "level_name"),
+                             ("sign_days", "sign_days")):
+                if prof.get(key) is not None and prof.get(key) != "":
+                    updates[col] = prof[key]
+                    account[col] = prof[key]
         if updates:
             db.update_account(acc_id, **updates)
         if account.get("refresh_token"):
@@ -197,16 +201,44 @@ def run_haier_account(account: dict, do_checkin: bool = True,
     # ---- 2. 每日签到 ----
     if do_checkin:
         try:
-            status, message, sign_days = haier.checkin(account)
+            status, message, sign_days, reward_point = haier.checkin(account)
         except Exception as exc:
             logger.exception("[%s] 海尔签到异常", acc_name)
-            status, message, sign_days = "fail", f"【海尔】异常: {exc}", None
+            status, message, sign_days, reward_point = "fail", f"【海尔】异常: {exc}", None, None
 
-        updates = {"last_status": status, "last_message": message, "last_run_at": db.now_iso()}
+        # 签到后重新查询一次最新海贝积分与成长值，确保展示签到后的最新积分
+        if status in ("ok", "already"):
+            try:
+                profile = haier.fetch_profile(account)
+                result["profile"] = profile
+                for col, key in (("nickname", "nickname"), ("balance", "balance"),
+                                 ("growth_value", "growth_value"), ("level_name", "level_name")):
+                    if profile.get(key) is not None and profile.get(key) != "":
+                        account[col] = profile[key]
+            except Exception as exc:
+                logger.warning("[%s] 海尔签到后刷新积分失败: %s", acc_name, exc)
+
+            cur_haibei = (result.get("profile") or {}).get("balance")
+            if cur_haibei is None:
+                cur_haibei = account.get("balance")
+            if cur_haibei is not None:
+                message = f"{message}，当前海贝 {int(cur_haibei)}"
+
+        updates = {
+            "last_status": status,
+            "last_message": message,
+            "last_run_at": db.now_iso(),
+            "balance": account.get("balance", 0),
+            "growth_value": account.get("growth_value", 0),
+            "level_name": account.get("level_name", ""),
+            "nickname": account.get("nickname", ""),
+        }
         if sign_days is not None:
             updates["sign_days"] = sign_days
             account["sign_days"] = sign_days
             result["sign_days"] = sign_days
+        if reward_point is not None:
+            result["reward_point"] = reward_point
         db.update_account(acc_id, **updates)
         db.add_log(acc_id, acc_name, "checkin_haier", status, message)
         result["checkin_status"] = status
@@ -225,8 +257,14 @@ def run_haier_account(account: dict, do_checkin: bool = True,
         try:
             profile = haier.fetch_profile(account)
             result["profile"] = profile
-            if profile.get("nickname"):
-                db.update_account(acc_id, nickname=profile["nickname"])
+            prof_updates = {}
+            for col, key in (("nickname", "nickname"), ("balance", "balance"),
+                             ("growth_value", "growth_value"), ("level_name", "level_name"),
+                             ("sign_days", "sign_days")):
+                if profile.get(key) is not None and profile.get(key) != "":
+                    prof_updates[col] = profile[key]
+            if prof_updates:
+                db.update_account(acc_id, **prof_updates)
         except haier.HaierError as exc:
             result["error"] = result["error"] or str(exc)
 

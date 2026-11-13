@@ -538,14 +538,15 @@ function renderHaierCard(a) {
           <span class="plat-tag plat-haier">海尔智家</span>
         </div>
         <div class="card-sub">${a.token_mask || ""} · <span style="color:${refColor}">${refLabel}</span></div>
-        <div class="card-sched">每日签到 ${escapeHtml((a.windows && a.windows.haier) || "—")}</div>
+        <div class="card-sched">每日签到 ${escapeHtml((a.windows && a.windows.haier) || "—")} · ${escapeHtml(srcText)}</div>
       </div>
       <span class="badge ${cls}">${label}</span>
     </div>
-    <div class="metrics">
-      <div class="metric"><div class="k">连续签到</div><div class="v cyan">${a.sign_days ?? 0}<small style="font-size:11px;font-weight:400;color:var(--dim);margin-left:3px">天</small></div></div>
-      <div class="metric"><div class="k">凭据来源</div><div class="v" style="font-size:15px">${escapeHtml(srcText)}</div></div>
-      <div class="metric"><div class="k">账号昵称</div><div class="v" style="font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(a.nickname || a.name || "—")}</div></div>
+    <div class="metrics" style="grid-template-columns:repeat(4,1fr)">
+      <div class="metric"><div class="k">成长值</div><div class="v">${a.growth_value ?? 0}</div></div>
+      <div class="metric"><div class="k">等级</div><div class="v">${escapeHtml(a.level_name || "—")}</div></div>
+      <div class="metric"><div class="k">连续签到</div><div class="v">${a.sign_days ?? 0}<small style="font-size:11px;font-weight:400;color:var(--dim);margin-left:2px">天</small></div></div>
+      <div class="metric"><div class="k">海贝积分</div><div class="v cyan">${a.balance ?? 0}</div></div>
     </div>
     <div class="bar-label"><span>token 有效期</span><span>${dayText}</span></div>
     <div class="bar ${barCls}"><i style="width:${pct}%"></i></div>

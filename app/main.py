@@ -418,6 +418,10 @@ def api_haier_login(
         "app_source": app_source,
         "platform": "haier",
         "user_agent": haier.DEFAULT_UA,
+        "growth_value": profile.get("growth_value", 0),
+        "level_name": profile.get("level_name", ""),
+        "balance": profile.get("balance", 0),
+        "sign_days": profile.get("sign_days", 0),
         "nickname": profile.get("nickname", ""),
         "expire_at": haier.expire_at(login_res.get("expires_in")),
     })
@@ -511,6 +515,10 @@ async def api_haier_bind(
         "app_source": account["app_source"],
         "platform": "haier",
         "user_agent": account["user_agent"],
+        "growth_value": profile.get("growth_value", 0),
+        "level_name": profile.get("level_name", ""),
+        "balance": profile.get("balance", 0),
+        "sign_days": profile.get("sign_days", 0),
         "nickname": profile.get("nickname", ""),
         "expire_at": haier.expire_at(expires_in),
     })
