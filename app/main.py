@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db, dxrisk, longhu, parser, runner, scheduler
+from . import db, dxrisk, haier, longhu, parser, runner, scheduler
 from . import login as app_login
 
 logging.basicConfig(
@@ -59,10 +59,14 @@ def _decorate(account: dict, usage: dict[str, list[dict]] | None = None,
     settings = settings if settings is not None else db.get_settings()
     next_runs = next_runs or {}
     item = dict(account)
-    for key in ("token", "user_agent", "api_key", "dx_token"):  # 敏感字段不外发
+    for key in ("token", "user_agent", "api_key", "dx_token", "refresh_token"):  # 敏感字段不外发
         item.pop(key, None)
     token = account.get("token") or ""
     item["token_mask"] = f"{token[:6]}...{token[-4:]}" if len(token) > 12 else "****"
+    item["platform"] = (account.get("platform") or "longhu").strip() or "longhu"
+    item["has_refresh"] = bool((account.get("refresh_token") or "").strip())
+    item["app_source"] = (account.get("app_source") or "wxapp").strip()
+    item["sign_days"] = int(account.get("sign_days") or 0)
 
     # 设备指纹状态。同一指纹用于多个账号会触发风控（2026-11-03 实测），
     # 指纹归 id 最小的账号所有，其余账号会被标记为冲突并暂停签到。
@@ -77,16 +81,17 @@ def _decorate(account: dict, usage: dict[str, list[dict]] | None = None,
     item["dx_shared_with"] = [a["name"] for a in shared]
     item["dx_conflict"] = any(a["id"] < account["id"] for a in shared)
     item["days_left"] = runner.days_left(account.get("expire_at"))
-    # 两个入口各自的窗口：账号自定义优先，否则跟随全局
+    # 各入口各自的窗口：账号自定义优先，否则跟随全局
     item["mini_time"] = (account.get("mini_time") or "").strip()
     item["app_time"] = (account.get("app_time") or "").strip()
+    all_entries = (*db.SLOT_ENTRIES, "haier")
     item["windows"] = {
         entry: scheduler.account_window(account, entry, settings)
-        for entry in db.SLOT_ENTRIES
+        for entry in all_entries
     }
     item["next_runs"] = {
         entry: next_runs.get(f"{account['id']}:{entry}", "")
-        for entry in db.SLOT_ENTRIES
+        for entry in all_entries
     }
     return item
 
@@ -310,6 +315,7 @@ def api_login_verify(
     number = _valid_mobile(mobile)
     fp = fingerprint.strip()
     sms = (code or "").strip()
+    pkey = (profile or "").strip().lower()
     if not re.fullmatch(r"\d{4,8}", sms):
         raise HTTPException(400, "验证码应为 4–8 位数字")
     if not fp:
@@ -331,15 +337,15 @@ def api_login_verify(
         raise HTTPException(400, f"这个账号已经添加过了：{existing['name']}")
 
     # 登录态和现有签到链路通用；查资料只是为了填默认名/成长值，失败不阻断入库。
-    profile: dict = {}
+    user_profile: dict = {}
     try:
-        profile = longhu.probe_token(token)
+        user_profile = longhu.probe_token(token)
     except longhu.LonghuError as exc:
         logger.warning("新登录账号资料查询失败（不影响入库）：%s", exc)
 
     final_name = (
         (name or "").strip()
-        or profile.get("phone")
+        or user_profile.get("phone")
         or f"龙湖账号 {len(db.list_accounts()) + 1}"
     )
     account_id = db.create_account({
@@ -350,18 +356,200 @@ def api_login_verify(
         "dx_token": fp,
         "bu_code": "C20400",
         "channel": "C2",
-        "growth_value": profile.get("growth_value", 0),
-        "level_name": profile.get("level_name", ""),
-        "balance": profile.get("balance", 0),
-        "nickname": profile.get("nickname", ""),
+        "growth_value": user_profile.get("growth_value", 0),
+        "level_name": user_profile.get("level_name", ""),
+        "balance": user_profile.get("balance", 0),
+        "nickname": user_profile.get("nickname", ""),
         "expire_at": longhu.expire_at(),
     })
-    pkey = (profile or "").strip().lower()
     pname = dxrisk.DEVICE_PROFILES.get(pkey, {}).get("name", "自动分配")
+    scheduler.reschedule()
     db.add_log(account_id, final_name, "login", "ok",
                f"手机号验证码登录成功，设备指纹已同步（机型 {pname}，lmid "
                f"{result.get('lmid') or '-'}）")
+    return {"ok": True, "id": account_id, "name": final_name, "profile": user_profile}
+
+
+# --------------------------------------------------------------------------
+# 海尔智家：密码登录 + 抓包凭据导入 + 凭据更新
+# --------------------------------------------------------------------------
+
+@app.post("/api/haier/login")
+def api_haier_login(
+    mobile: str = Form(...),
+    password: str = Form(...),
+    name: str = Form(""),
+):
+    """海尔智家手机号 + 密码登录，直拿 accountToken 与 refreshToken。"""
+    try:
+        login_res = haier.phone_login(mobile, password)
+    except haier.HaierError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    token = login_res["token"]
+    refresh_tok = login_res.get("refresh_token") or ""
+    client_id = login_res.get("client_id") or haier.random_client_id()
+    app_source = login_res.get("app_source") or haier.APP_SOURCE_APP
+
+    profile = {}
+    try:
+        profile = haier.fetch_profile({
+            "token": token,
+            "client_id": client_id,
+            "app_source": app_source,
+        })
+    except haier.HaierError as exc:
+        logger.warning("海尔登录成功但拉取资料失败：%s", exc)
+
+    haier_count = sum(1 for a in db.list_accounts() if (a.get("platform") or "longhu") == "haier")
+    final_name = (
+        (name or "").strip()
+        or profile.get("phone")
+        or profile.get("nickname")
+        or haier.mask_phone(mobile)
+        or f"海尔账号 {haier_count + 1}"
+    )
+
+    account_id = db.create_account({
+        "name": final_name,
+        "token": token,
+        "refresh_token": refresh_tok,
+        "client_id": client_id,
+        "app_source": app_source,
+        "platform": "haier",
+        "user_agent": haier.DEFAULT_UA,
+        "nickname": profile.get("nickname", ""),
+        "expire_at": haier.expire_at(login_res.get("expires_in")),
+    })
+    scheduler.reschedule()
+    db.add_log(account_id, final_name, "login", "ok", "海尔智家密码登录成功，已启用自动续期")
     return {"ok": True, "id": account_id, "name": final_name, "profile": profile}
+
+
+@app.post("/api/haier/bind")
+async def api_haier_bind(
+    mode: str = Form("token"),
+    name: str = Form(""),
+    payload: str = Form(""),
+    refresh_token: str = Form(""),
+    client_id: str = Form(""),
+    app_source: str = Form("wxapp"),
+    file: UploadFile | None = File(None),
+):
+    """海尔智家抓包导入：支持 HAR 上传、cURL 粘贴、手动填写 accountToken / refreshToken。"""
+    if mode == "har":
+        if file is None:
+            raise HTTPException(400, "请先选择要上传的 HAR 文件")
+        raw = await file.read()
+    else:
+        raw = payload
+
+    try:
+        parsed = haier.parse(
+            mode,
+            raw,
+            refresh_token=refresh_token,
+            client_id=client_id,
+            app_source=app_source,
+        )
+    except haier.HaierError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    account = {
+        "token": parsed.get("token") or "",
+        "refresh_token": parsed.get("refresh_token") or "",
+        "client_id": parsed.get("client_id") or haier.random_client_id(),
+        "app_source": parsed.get("app_source") or haier.APP_SOURCE_WXAPP,
+        "user_agent": parsed.get("user_agent") or haier.DEFAULT_UA,
+    }
+
+    # 如果只填了 refreshToken 或 token 已过期，先尝试用 refreshToken 换新 token
+    expires_in = None
+    if account["refresh_token"] and not account["token"]:
+        ok, ref_res = haier.refresh_token(account)
+        if not ok or not isinstance(ref_res, dict):
+            raise HTTPException(400, f"refreshToken 换取 token 失败：{ref_res}")
+        account["token"] = ref_res["token"]
+        account["refresh_token"] = ref_res.get("refresh_token") or account["refresh_token"]
+        account["app_source"] = ref_res.get("app_source") or account["app_source"]
+        expires_in = ref_res.get("expires_in")
+
+    profile = {}
+    try:
+        profile = haier.fetch_profile(account)
+    except haier.HaierError as exc:
+        # 若 token 失效但带有 refreshToken，自动刷新一次再试
+        if account["refresh_token"]:
+            ok, ref_res = haier.refresh_token(account)
+            if ok and isinstance(ref_res, dict):
+                account["token"] = ref_res["token"]
+                account["refresh_token"] = ref_res.get("refresh_token") or account["refresh_token"]
+                account["app_source"] = ref_res.get("app_source") or account["app_source"]
+                expires_in = ref_res.get("expires_in")
+                try:
+                    profile = haier.fetch_profile(account)
+                except haier.HaierError:
+                    pass
+            else:
+                raise HTTPException(400, f"凭据校验与刷新均失败：{ref_res}") from exc
+        else:
+            raise HTTPException(400, f"海尔凭据校验失败：{exc}") from exc
+
+    haier_count = sum(1 for a in db.list_accounts() if (a.get("platform") or "longhu") == "haier")
+    final_name = (
+        (name or "").strip()
+        or profile.get("phone")
+        or profile.get("nickname")
+        or f"海尔账号 {haier_count + 1}"
+    )
+
+    account_id = db.create_account({
+        "name": final_name,
+        "token": account["token"],
+        "refresh_token": account["refresh_token"] or None,
+        "client_id": account["client_id"],
+        "app_source": account["app_source"],
+        "platform": "haier",
+        "user_agent": account["user_agent"],
+        "nickname": profile.get("nickname", ""),
+        "expire_at": haier.expire_at(expires_in),
+    })
+    scheduler.reschedule()
+    db.add_log(account_id, final_name, "bind", "ok", f"{parsed['note']}，校验通过")
+    return {"ok": True, "id": account_id, "name": final_name, "profile": profile}
+
+
+@app.post("/api/accounts/{account_id}/haier-cred")
+def api_set_haier_cred(
+    account_id: int,
+    token: str = Form(""),
+    refresh_token: str = Form(""),
+    app_source: str = Form(""),
+):
+    """更新海尔智家账号的 accountToken / refreshToken。"""
+    account = db.get_account(account_id)
+    if not account:
+        raise HTTPException(404, "账号不存在")
+    if (account.get("platform") or "longhu") != "haier":
+        raise HTTPException(400, "该账号不是海尔智家账号")
+
+    tok = token.strip()
+    ref = refresh_token.strip()
+    if not tok and not ref:
+        raise HTTPException(400, "请至少填写 accountToken 或 refreshToken")
+
+    updates = {}
+    if tok:
+        updates["token"] = tok
+    if ref:
+        updates["refresh_token"] = ref
+    if app_source.strip() in haier.APP_SOURCES:
+        updates["app_source"] = app_source.strip()
+    updates["expire_at"] = haier.expire_at()
+
+    db.update_account(account_id, **updates)
+    db.add_log(account_id, account["name"], "bind", "ok", "已更新海尔智家凭据")
+    return {"ok": True}
 
 
 @app.post("/api/accounts/{account_id}/dx")
@@ -442,15 +630,21 @@ def api_overview():
             stats[status if status in stats else "fail"] += 1
 
     settings = db.get_settings()
+    longhu_count = sum(1 for a in accounts if (a.get("platform") or "longhu") == "longhu")
+    haier_count = sum(1 for a in accounts if (a.get("platform") or "longhu") == "haier")
     return {
         "total": len(accounts),
+        "longhu_count": longhu_count,
+        "haier_count": haier_count,
         "stats": stats,
         "min_days": min_days,
         "next_run": scheduler.next_run_text(),
         "checkin_time": settings.get("checkin_time", "08:00"),
         "app_checkin_time": settings.get("app_checkin_time", "09:30"),
+        "haier_checkin_time": settings.get("haier_checkin_time", "08:15"),
         "window": scheduler.window_text("mini"),
         "app_window": scheduler.window_text("app"),
+        "haier_window": scheduler.window_text("haier"),
     }
 
 
@@ -467,8 +661,11 @@ def api_get_settings():
         "checkin_jitter": data.get("checkin_jitter", "60"),
         "app_checkin_time": data.get("app_checkin_time", "09:30"),
         "app_checkin_jitter": data.get("app_checkin_jitter", "60"),
+        "haier_checkin_time": data.get("haier_checkin_time", "08:15"),
+        "haier_checkin_jitter": data.get("haier_checkin_jitter", "60"),
         "window": scheduler.window_text("mini"),
         "app_window": scheduler.window_text("app"),
+        "haier_window": scheduler.window_text("haier"),
         "webhook_url": data.get("webhook_url", ""),
         "app_checkin_mode": data.get("app_checkin_mode", "manual"),
         "next_run": scheduler.next_run_text(),
@@ -506,17 +703,28 @@ def api_save_settings(
     checkin_jitter: str | None = Form(None),
     app_checkin_time: str | None = Form(None),
     app_checkin_jitter: str | None = Form(None),
+    haier_checkin_time: str | None = Form(None),
+    haier_checkin_jitter: str | None = Form(None),
     app_checkin_mode: str | None = Form(None),
 ):
     mini_time = _parse_time_field(checkin_time, "小程序时间")
     app_time = _parse_time_field(app_checkin_time or db.get_settings().get("app_checkin_time", "09:30"),
                                  "APP 时间")
+    haier_time = _parse_time_field(haier_checkin_time or db.get_settings().get("haier_checkin_time", "08:15"),
+                                   "海尔签到时间")
     _check_gap(mini_time, app_time)
 
-    values = {"checkin_time": mini_time, "webhook_url": webhook_url.strip(),
-              "app_checkin_time": app_time}
-    for field, key, label in ((checkin_jitter, "checkin_jitter", "随机浮动"),
-                              (app_checkin_jitter, "app_checkin_jitter", "APP 随机浮动")):
+    values = {
+        "checkin_time": mini_time,
+        "webhook_url": webhook_url.strip(),
+        "app_checkin_time": app_time,
+        "haier_checkin_time": haier_time,
+    }
+    for field, key, label in (
+        (checkin_jitter, "checkin_jitter", "随机浮动"),
+        (app_checkin_jitter, "app_checkin_jitter", "APP 随机浮动"),
+        (haier_checkin_jitter, "haier_checkin_jitter", "海尔随机浮动"),
+    ):
         if field is None or field.strip() == "":
             continue
         try:
@@ -538,6 +746,7 @@ def api_save_settings(
         "ok": True,
         "window": scheduler.window_text("mini"),
         "app_window": scheduler.window_text("app"),
+        "haier_window": scheduler.window_text("haier"),
         "next_run": scheduler.next_run_text(),
     }
 
@@ -550,23 +759,29 @@ def api_set_schedule(account_id: int, mini_time: str = Form(""),
     if not account:
         raise HTTPException(404, "账号不存在")
 
-    mini_value = _parse_time_field(mini_time, "小程序时间") if mini_time.strip() else ""
-    app_value = _parse_time_field(app_time, "APP 时间") if app_time.strip() else ""
+    is_haier = (account.get("platform") or "longhu") == "haier"
+    mini_value = _parse_time_field(mini_time, "签到时间" if is_haier else "小程序时间") if mini_time.strip() else ""
+    app_value = _parse_time_field(app_time, "APP 时间") if (not is_haier and app_time.strip()) else ""
 
-    settings = db.get_settings()
-    effective = dict(account, mini_time=mini_value, app_time=app_value)
-    _check_gap(
-        scheduler.effective_start(effective, "mini", settings),
-        scheduler.effective_start(effective, "app", settings),
-    )
+    if not is_haier:
+        settings = db.get_settings()
+        effective = dict(account, mini_time=mini_value, app_time=app_value)
+        _check_gap(
+            scheduler.effective_start(effective, "mini", settings),
+            scheduler.effective_start(effective, "app", settings),
+        )
 
     db.update_account(account_id, mini_time=mini_value or None, app_time=app_value or None)
-    for entry in db.SLOT_ENTRIES:
+    for entry in (("haier",) if is_haier else db.SLOT_ENTRIES):
         db.clear_slot_plan(account_id, entry)
     scheduler.reschedule()
-    db.add_log(account_id, account["name"], "schedule", "ok",
-               f"签到时间已更新：小程序 {mini_value or '跟随全局'}，"
-               f"APP {app_value or '跟随全局'}")
+    if is_haier:
+        db.add_log(account_id, account["name"], "schedule", "ok",
+                   f"签到时间已更新：{mini_value or '跟随全局'}")
+    else:
+        db.add_log(account_id, account["name"], "schedule", "ok",
+                   f"签到时间已更新：小程序 {mini_value or '跟随全局'}，"
+                   f"APP {app_value or '跟随全局'}")
     return {"ok": True}
 
 

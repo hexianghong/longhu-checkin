@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 DB_PATH = os.path.join(os.environ.get("DATA_DIR", "./data"), "longhu.db")
 _lock = threading.Lock()
+_initialized_path: str | None = None
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
@@ -30,6 +31,11 @@ CREATE TABLE IF NOT EXISTS accounts (
     enabled       INTEGER DEFAULT 1,
     mini_time     TEXT,
     app_time      TEXT,
+    platform      TEXT DEFAULT 'longhu',
+    refresh_token TEXT,
+    client_id     TEXT,
+    app_source    TEXT DEFAULT 'wxapp',
+    sign_days     INTEGER DEFAULT 0,
     created_at    TEXT,
     updated_at    TEXT
 );
@@ -73,6 +79,9 @@ DEFAULT_SETTINGS = {
     # APP 专享入口：默认比小程序晚一个半小时，避免两个入口同一时刻连着打
     "app_checkin_time": "09:30",
     "app_checkin_jitter": "60",
+    # 海尔智家入口
+    "haier_checkin_time": "08:15",
+    "haier_checkin_jitter": "60",
     "last_run_date": "",
     "retry_at": "",
     "retry_count": "0",
@@ -90,11 +99,22 @@ def now_iso() -> str:
 
 @contextmanager
 def connect():
-    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    global _initialized_path
+    abs_path = os.path.abspath(DB_PATH)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
     with _lock:
         conn = sqlite3.connect(DB_PATH, timeout=15)
         conn.row_factory = sqlite3.Row
         try:
+            if _initialized_path != abs_path:
+                conn.executescript(SCHEMA)
+                _migrate(conn)
+                for key, value in DEFAULT_SETTINGS.items():
+                    conn.execute(
+                        "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)",
+                        (key, value),
+                    )
+                _initialized_path = abs_path
             yield conn
             conn.commit()
         finally:
@@ -102,13 +122,10 @@ def connect():
 
 
 def init():
-    with connect() as conn:
-        conn.executescript(SCHEMA)
-        _migrate(conn)
-        for key, value in DEFAULT_SETTINGS.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value)
-            )
+    global _initialized_path
+    _initialized_path = None
+    with connect():
+        pass
 
 
 # 建表之后新增的列：老库用 ALTER TABLE 补，新库由 SCHEMA 直接带上
@@ -119,6 +136,12 @@ MIGRATIONS = {
         # 单账号自定义的两个入口时间，留空表示跟随全局设置
         "mini_time": "ALTER TABLE accounts ADD COLUMN mini_time TEXT",
         "app_time": "ALTER TABLE accounts ADD COLUMN app_time TEXT",
+        # 平台区分（longhu / haier）及海尔智家专用字段
+        "platform": "ALTER TABLE accounts ADD COLUMN platform TEXT DEFAULT 'longhu'",
+        "refresh_token": "ALTER TABLE accounts ADD COLUMN refresh_token TEXT",
+        "client_id": "ALTER TABLE accounts ADD COLUMN client_id TEXT",
+        "app_source": "ALTER TABLE accounts ADD COLUMN app_source TEXT DEFAULT 'wxapp'",
+        "sign_days": "ALTER TABLE accounts ADD COLUMN sign_days INTEGER DEFAULT 0",
     },
 }
 
@@ -157,8 +180,9 @@ def create_account(data: dict) -> int:
             """INSERT INTO accounts
                (name, token, user_agent, api_key, dx_token, bu_code, channel,
                 growth_value, level_name, balance, nickname,
-                mini_time, app_time, expire_at, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                mini_time, app_time, platform, refresh_token, client_id, app_source, sign_days,
+                expire_at, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 data["name"], data["token"], data.get("user_agent"), data.get("api_key"),
                 data.get("dx_token"),
@@ -166,6 +190,11 @@ def create_account(data: dict) -> int:
                 data.get("growth_value", 0), data.get("level_name", ""),
                 data.get("balance", 0), data.get("nickname", ""),
                 data.get("mini_time"), data.get("app_time"),
+                data.get("platform", "longhu"),
+                data.get("refresh_token"),
+                data.get("client_id"),
+                data.get("app_source", "wxapp"),
+                data.get("sign_days", 0),
                 data.get("expire_at"), ts, ts,
             ),
         )

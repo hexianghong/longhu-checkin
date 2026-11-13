@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from . import db, longhu
+from . import db, haier, longhu
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +138,103 @@ def _app_entry(account: dict, item: dict, mode: str) -> tuple[str, str]:
     return "todo", f"{label}状态未知，请在 App 内确认，或把 APP 模式改回 auto"
 
 
+def run_haier_account(account: dict, do_checkin: bool = True,
+                      with_profile: bool = True) -> dict:
+    """执行单个海尔智家账号的续期 → 签到 → 资料刷新流程。"""
+    acc_id = account["id"]
+    acc_name = account["name"]
+    result = {
+        "account_id": acc_id,
+        "name": acc_name,
+        "platform": "haier",
+        "refreshed": False,
+        "checkin_status": "skipped",
+        "checkin_message": "",
+        "extra_signs": [],
+        "profile": {},
+        "error": "",
+    }
+
+    # ---- 1. 续期 / 校验 ----
+    try:
+        ok, payload = haier.refresh_token(account)
+    except haier.HaierError as exc:
+        ok, payload = False, str(exc)
+
+    if ok and isinstance(payload, dict):
+        result["refreshed"] = True
+        updates = {}
+        new_tok = payload.get("token")
+        if new_tok and new_tok != account.get("token"):
+            updates["token"] = new_tok
+            account["token"] = new_tok
+        new_ref = payload.get("refresh_token")
+        if new_ref and new_ref != account.get("refresh_token"):
+            updates["refresh_token"] = new_ref
+            account["refresh_token"] = new_ref
+        new_src = payload.get("app_source")
+        if new_src and new_src != account.get("app_source"):
+            updates["app_source"] = new_src
+            account["app_source"] = new_src
+        if payload.get("expires_in"):
+            updates["expire_at"] = haier.expire_at(payload["expires_in"])
+        if payload.get("profile"):
+            result["profile"] = payload["profile"]
+            nick = payload["profile"].get("nickname")
+            if nick:
+                updates["nickname"] = nick
+        if updates:
+            db.update_account(acc_id, **updates)
+        if account.get("refresh_token"):
+            db.add_log(acc_id, acc_name, "refresh", "ok", payload.get("message") or "token 已续期")
+    elif not ok:
+        err_msg = str(payload)
+        if account.get("refresh_token"):
+            db.add_log(acc_id, acc_name, "refresh", "fail", err_msg)
+        result["error"] = err_msg
+        logger.warning("[%s] 海尔续期/校验失败: %s", acc_name, err_msg)
+
+    # ---- 2. 每日签到 ----
+    if do_checkin:
+        try:
+            status, message, sign_days = haier.checkin(account)
+        except Exception as exc:
+            logger.exception("[%s] 海尔签到异常", acc_name)
+            status, message, sign_days = "fail", f"【海尔】异常: {exc}", None
+
+        updates = {"last_status": status, "last_message": message, "last_run_at": db.now_iso()}
+        if sign_days is not None:
+            updates["sign_days"] = sign_days
+            account["sign_days"] = sign_days
+            result["sign_days"] = sign_days
+        db.update_account(acc_id, **updates)
+        db.add_log(acc_id, acc_name, "checkin_haier", status, message)
+        result["checkin_status"] = status
+        result["checkin_message"] = message
+
+        if status == "fail":
+            refresh_text = "成功" if ok else f"失败（{result['error'] or '未配置 refreshToken'}）"
+            tail = "请检查或更新海尔智家凭据。" if not ok else "将按排程在当天内自动重试。"
+            notify(
+                f"【海尔签到】{acc_name} 失败\n"
+                f"续期: {refresh_text}\n签到: {message}\n{tail}"
+            )
+
+    # ---- 3. 刷新资料 ----
+    if with_profile and not result.get("profile"):
+        try:
+            profile = haier.fetch_profile(account)
+            result["profile"] = profile
+            if profile.get("nickname"):
+                db.update_account(acc_id, nickname=profile["nickname"])
+        except haier.HaierError as exc:
+            result["error"] = result["error"] or str(exc)
+
+    days = days_left(db.get_account(acc_id).get("expire_at"))
+    result["days_left"] = days
+    return result
+
+
 def run_account(account: dict, do_checkin: bool = True,
                 app_mode: str | None = None,
                 entries: tuple[str, ...] | None = None,
@@ -148,6 +245,9 @@ def run_account(account: dict, do_checkin: bool = True,
     entries 为 None 时两个入口都跑；只给一个入口时用于分时排期。
     with_profile=False 时跳过资料刷新，省一次请求（分时排期的第二个入口用）。
     """
+    if (account.get("platform") or "longhu") == "haier":
+        return run_haier_account(account, do_checkin=do_checkin, with_profile=with_profile)
+
     acc_id = account["id"]
     acc_name = account["name"]
     wanted = set(entries) if entries else {item["key"] for item in longhu.ACTIVITIES}

@@ -38,7 +38,7 @@ RETRY_MINUTES = 10
 # 不需要重试的状态：已签、已签过、指纹冲突、风控、待人工、已关闭
 NO_RETRY_STATUS = {"already", "conflict", "risk", "todo", "skipped"}
 
-ENTRY_LABEL = {"mini": "小程序", "app": "APP"}
+ENTRY_LABEL = {"mini": "小程序", "app": "APP", "haier": "海尔智家"}
 
 scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 
@@ -73,7 +73,11 @@ def _parse_iso(text: str | None) -> datetime | None:
 
 
 def _jitter(settings: dict, entry: str) -> int:
-    key = "checkin_jitter" if entry == "mini" else "app_checkin_jitter"
+    key = (
+        "checkin_jitter" if entry == "mini"
+        else "haier_checkin_jitter" if entry == "haier"
+        else "app_checkin_jitter"
+    )
     try:
         value = int(float(settings.get(key) or 0))
     except (TypeError, ValueError):
@@ -84,9 +88,11 @@ def _jitter(settings: dict, entry: str) -> int:
 def _start(settings: dict, account: dict | None, entry: str) -> tuple[int, int]:
     """入口的窗口起点。账号自定义优先，其次全局。"""
     if account:
-        custom = (account.get("mini_time") if entry == "mini" else account.get("app_time")) or ""
+        custom = (account.get("app_time") if entry == "app" else account.get("mini_time")) or ""
         if custom.strip():
             return _parse_hhmm(custom.strip())
+    if entry == "haier":
+        return _parse_hhmm(settings.get("haier_checkin_time") or "08:15", fallback=(8, 15))
     key = "checkin_time" if entry == "mini" else "app_checkin_time"
     return _parse_hhmm(settings.get(key) or DEFAULT_TIME)
 
@@ -193,7 +199,7 @@ def _slot_job(account_id: int, entry: str):
             account,
             do_checkin=True,
             entries=(entry,),
-            with_profile=(entry == "mini"),
+            with_profile=(entry in ("mini", "haier")),
         )
         status = result.get("checkin_status") or "fail"
     except Exception:
@@ -229,7 +235,10 @@ def _planner():
 
         wanted: dict[str, tuple[dict, str]] = {}
         for account in accounts:
-            entries = ("mini",) if app_mode == "off" else db.SLOT_ENTRIES
+            if (account.get("platform") or "longhu") == "haier":
+                entries = ("haier",)
+            else:
+                entries = ("mini",) if app_mode == "off" else db.SLOT_ENTRIES
             for entry in entries:
                 wanted[_job_id(account["id"], entry)] = (account, entry)
 
