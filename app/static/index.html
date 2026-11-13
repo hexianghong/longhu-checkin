@@ -88,12 +88,15 @@
   .empty b { display: block; color: var(--text); margin-bottom: 6px; font-size: 15px; }
 
   .logs { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
-  .log-row { display: grid; grid-template-columns: 118px 96px 66px 1fr; gap: 12px; padding: 10px 16px; font-size: 12.5px; border-bottom: 1px solid #1b2029; align-items: center; }
+  .log-row { display: grid; grid-template-columns: 118px 96px 88px 1fr; gap: 12px; padding: 10px 16px; font-size: 12.5px; border-bottom: 1px solid #1b2029; align-items: center; }
   .log-row:last-child { border-bottom: 0; }
   .log-row .t { color: var(--dim); font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; }
   .log-row .n { color: #c3cbd8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .log-row .a { color: var(--dim); }
+  .log-row .a { color: var(--dim); white-space: nowrap; }
   .log-row .m { color: #9aa5b6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tag-act { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px; line-height: 1.4; font-weight: 500; }
+  .tag-mini { color: #34d399; background: rgba(52, 211, 153, 0.12); border: 1px solid rgba(52, 211, 153, 0.25); }
+  .tag-app { color: #60a5fa; background: rgba(96, 165, 250, 0.12); border: 1px solid rgba(96, 165, 250, 0.25); }
   .s-ok { color: var(--green); }
   .s-fail { color: var(--red); }
   .s-already { color: #7ba7e8; }
@@ -400,11 +403,15 @@ function renderLogs(logs) {
     const scls = l.status === "ok" ? "s-ok"
       : (l.status === "fail" || l.status === "risk") ? "s-fail"
       : l.status === "already" ? "s-already" : l.status === "todo" ? "s-todo" : "";
-    const names = { refresh: "续期", checkin: "签到", checkin_app: "APP签到", query: "查询", bind: "绑定", login: "登录", run: "执行", dx: "指纹" };
+    const names = { refresh: "续期", checkin: "小程序签到", checkin_app: "APP签到", query: "查询", bind: "绑定", login: "登录", run: "执行", dx: "指纹" };
+    const actName = names[l.action] || l.action || "";
+    const actHtml = l.action === "checkin" ? `<span class="tag-act tag-mini">${actName}</span>`
+      : l.action === "checkin_app" ? `<span class="tag-act tag-app">${actName}</span>`
+      : escapeHtml(actName);
     return `<div class="log-row">
       <div class="t">${(l.ts || "").replace("T", " ").slice(5, 16)}</div>
       <div class="n">${escapeHtml(l.account_name || "")}</div>
-      <div class="a">${names[l.action] || l.action || ""}</div>
+      <div class="a">${actHtml}</div>
       <div class="m"><span class="${scls}">${escapeHtml(l.message || "")}</span></div>
     </div>`;
   }).join("");

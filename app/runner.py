@@ -120,7 +120,7 @@ def _app_entry(account: dict, item: dict, mode: str) -> tuple[str, str]:
     manual ：只查状态，不打卡；未签就记 todo 交给每日汇总提醒人工去点
     off    ：完全不处理
     """
-    label = "APP "
+    label = "【APP】"
     if mode == "off":
         return "skipped", f"{label}已关闭"
     if not (account.get("dx_token") or "").strip():
@@ -206,7 +206,7 @@ def run_account(account: dict, do_checkin: bool = True,
             if item["key"] not in wanted:
                 continue
             is_main = item["key"] == "mini"
-            label = "" if is_main else "APP "
+            label = "【小程序】" if is_main else "【APP】"
             try:
                 if is_main:
                     status, message = longhu.checkin(account, item["activity_no"], label)
@@ -217,6 +217,33 @@ def run_account(account: dict, do_checkin: bool = True,
             except Exception as exc:  # 单个入口异常不影响另一个
                 logger.exception("[%s] %s 签到异常", acc_name, item["name"])
                 status, message = "fail", f"异常: {exc}"
+
+            if status == "ok":
+                # 签到成功后刷新资料，获取最新成长值并展示在日志中
+                try:
+                    profile = longhu.fetch_profile(account)
+                    result["profile"] = profile
+                    gv = profile.get("growth_value")
+                    if gv is not None:
+                        message = f"{message}，当前成长值 {gv}"
+                    account.update({
+                        "growth_value": profile.get("growth_value", 0),
+                        "level_name": profile.get("level_name", ""),
+                        "balance": profile.get("balance", 0),
+                        "nickname": profile.get("nickname", ""),
+                    })
+                    db.update_account(
+                        acc_id,
+                        growth_value=profile.get("growth_value", 0),
+                        level_name=profile.get("level_name", ""),
+                        balance=profile.get("balance", 0),
+                        nickname=profile.get("nickname", ""),
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] 签到后刷新资料失败: %s", acc_name, exc)
+                    gv = account.get("growth_value")
+                    if gv is not None:
+                        message = f"{message}，当前成长值 {gv}"
 
             db.add_log(acc_id, acc_name, "checkin" if is_main else "checkin_app",
                        status, message)
@@ -234,6 +261,11 @@ def run_account(account: dict, do_checkin: bool = True,
             # 但不回写账号的 last_status——那是主签到（小程序）的状态标识。
             result["checkin_status"] = extra[0]["status"]
             result["checkin_message"] = extra[0]["message"]
+        elif result["checkin_status"] != "ok" and extra:
+            app_ok = [e for e in extra if e.get("status") == "ok"]
+            if app_ok:
+                result["checkin_status"] = "ok"
+                result["checkin_message"] = app_ok[0]["message"]
         failed_main = result["checkin_status"] == "fail"
         if failed_main:
             # 签到失败一律告警。之前只在「续期也失败」时才推，导致签到被拒
@@ -257,7 +289,7 @@ def run_account(account: dict, do_checkin: bool = True,
         db.update_account(acc_id, last_status="conflict", last_message=dx_block)
 
     # ---- 3. 刷新资料 ----
-    if with_profile:
+    if with_profile and not result.get("profile"):
         try:
             profile = longhu.fetch_profile(account)
             result["profile"] = profile

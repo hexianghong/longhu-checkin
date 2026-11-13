@@ -691,6 +691,13 @@ docker compose up -d --build
 
 数据在卷里，不会丢。
 
+**Q：报错 `Failed to resolve 'gw2c-hw-open.longfor.com' ([Errno -2] Name or service not known)`？**
+这是运行环境（如 Docker、群晖或 Linux 宿主机）的 DNS 无法解析龙湖域名所致：
+- **Docker Compose**：项目 `docker-compose.yml` 已配置公共 DNS（223.5.5.5 / 119.29.29.29 / 114.114.114.114），执行 `docker compose down && docker compose up -d` 重建即可。
+- **Docker CLI**：启动时加上 `--dns 223.5.5.5 --dns 114.114.114.114`。
+- **Linux 宿主机**：检查 `/etc/resolv.conf`，确保配置了可用的公网 nameserver。
+- **群晖 NAS**：在“控制面板 -> 网络 -> 常规”中勾选手动配置 DNS 服务器（如 223.5.5.5）。
+
 ## 安全提醒
 
 **这个服务本身没有登录鉴权**，任何能访问端口的人都能看到你的账号状态、也能删账号。所以：
